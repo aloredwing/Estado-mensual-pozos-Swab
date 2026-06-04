@@ -1,7 +1,8 @@
-streamlit==1.47.1
-pandas==2.2.3
-openpyxl==3.1.5
-plotly==6.2.0
+streamlit
+pandas
+openpyxl
+plotly
 kaleido==0.2.1
-python-pptx==1.0.2
-numpy==2.0.2
+python-pptx
+numpy
+xlsxwriter
