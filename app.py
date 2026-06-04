@@ -21,7 +21,8 @@ except Exception:
     Presentation = None
 
 APP_TITLE = "Dashboard mensual de Estado de Pozos OIG"
-DATA_DIR = Path(__file__).parent / "data"
+APP_DIR = Path(__file__).parent
+DATA_DIR = APP_DIR / "data"
 
 MESES = {
     "ENERO": 1,
@@ -96,14 +97,25 @@ def infer_period(file_name: str, sheet_name: str, raw: pd.DataFrame) -> pd.Times
     file_mes = mes_from_text(file_name)
     file_norm = norm_txt(file_name)
 
-    mes = sheet_mes or title_mes or file_mes
-    anio = year_from_text(title)
+    # El mes se toma primero de la hoja, luego del archivo y finalmente del título.
+    # Esto evita errores por títulos copiados del mes anterior.
+    mes = sheet_mes or file_mes or title_mes
+    title_year = year_from_text(title)
+    anio = None
+
+    if title_year is not None:
+        # Caso típico: hoja Enero con título copiado de Diciembre del año anterior.
+        if title_mes == 12 and mes == 1:
+            anio = title_year + 1
+        else:
+            anio = title_year
 
     date_cell = first_date_from_cells(raw)
     if anio is None and date_cell is not None:
         anio = int(date_cell.year)
 
     if anio is None:
+        # Respaldo para los archivos sin año visible.
         if "OIG" in file_norm and mes in [1, 2, 3, 4, 5]:
             anio = 2025
         elif mes:
@@ -182,14 +194,37 @@ def clasificar_swab(row) -> str:
     return "No SWAB"
 
 
+def encontrar_archivos_excel() -> List[Path]:
+    """Busca la base fija en data/ y, como respaldo, en la raíz del proyecto."""
+    patterns = ["Estado de Pozos*.xlsx", "Estado_de_Pozos*.xlsx"]
+    found: List[Path] = []
+    search_dirs = [DATA_DIR, APP_DIR]
+    for folder in search_dirs:
+        if not folder.exists():
+            continue
+        for pat in patterns:
+            found.extend(folder.glob(pat))
+    # Eliminar temporales de Excel y duplicados exactos de ruta
+    unique = []
+    seen = set()
+    for p in found:
+        if p.name.startswith("~$"):
+            continue
+        key = str(p.resolve())
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return sorted(unique, key=lambda x: x.name)
+
+
 @st.cache_data(show_spinner="Cargando base fija de Excel...")
 def cargar_base() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if not DATA_DIR.exists():
-        return pd.DataFrame(), pd.DataFrame()
-
-    files = sorted(DATA_DIR.glob("Estado de Pozos*.xlsx"))
-    candidates: Dict[pd.Timestamp, Dict] = {}
+    files = encontrar_archivos_excel()
     log_rows = []
+    if not files:
+        return pd.DataFrame(), pd.DataFrame([{"archivo": "", "hoja": "", "periodo": "", "estado_carga": "No se encontraron archivos Excel en data/ ni en la raíz del proyecto"}])
+
+    candidates: Dict[pd.Timestamp, Dict] = {}
 
     for path in files:
         try:
@@ -463,7 +498,27 @@ def ui():
 
     base, log = cargar_base()
     if base.empty:
-        st.error("No se encontró información válida. Cree una carpeta data junto a app.py y coloque allí los Excel de Estado de Pozos.")
+        st.error("No se encontró información válida para graficar.")
+        st.markdown("""
+        Revise que el repositorio tenga esta estructura exacta:
+
+        ```text
+        app.py
+        requirements.txt
+        runtime.txt
+        data/
+          Estado de Pozos - Enero.xlsx
+          Estado de Pozos - Febrero.xlsx
+          Estado de Pozos - Marzo.xlsx
+          ...
+        ```
+        """)
+        encontrados = encontrar_archivos_excel()
+        st.write(f"Archivos Excel detectados por la app: {len(encontrados)}")
+        if encontrados:
+            st.dataframe(pd.DataFrame({"archivo_detectado": [p.name for p in encontrados]}), use_container_width=True)
+        if not log.empty:
+            st.dataframe(log, use_container_width=True)
         st.stop()
 
     periodos = sorted(base["fecha"].drop_duplicates().tolist())
