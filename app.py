@@ -169,6 +169,46 @@ def pozo_key(x) -> str:
 POZOS_ATA_EXCLUIR_KEYS = {pozo_key(p) for p in POZOS_ATA_EXCLUIR}
 
 
+def cargar_maestro_yacimientos() -> pd.DataFrame:
+    """
+    Opcional: si quieres gráfico por yacimiento, coloca en la carpeta Data/data
+    un archivo llamado Maestro_Yacimientos.xlsx, maestro_yacimientos.xlsx o similar,
+    con columnas POZO y YACIMIENTO.
+    """
+    posibles = []
+    for base_dir in DATA_DIR_CANDIDATES:
+        posibles.extend([
+            base_dir / "Maestro_Yacimientos.xlsx",
+            base_dir / "maestro_yacimientos.xlsx",
+            base_dir / "Maestro Yacimientos.xlsx",
+            base_dir / "maestro yacimientos.xlsx",
+        ])
+
+    path = next((p for p in posibles if p.exists()), None)
+    if path is None:
+        return pd.DataFrame(columns=["pozo_key", "yacimiento_maestro"])
+
+    try:
+        maestro = pd.read_excel(path, engine="openpyxl")
+    except Exception:
+        return pd.DataFrame(columns=["pozo_key", "yacimiento_maestro"])
+
+    cols = {norm_txt(c): c for c in maestro.columns}
+    col_pozo = next((cols[c] for c in cols if c in {"POZO", "COD_POZ", "CODIGO", "PFORMACION", "*PFORMACION"}), None)
+    col_yac = next((cols[c] for c in cols if c in {"YACIMIENTO", "YAC", "CAMPO", "UBICACION", "ZONA"}), None)
+
+    if col_pozo is None or col_yac is None:
+        return pd.DataFrame(columns=["pozo_key", "yacimiento_maestro"])
+
+    out = maestro[[col_pozo, col_yac]].copy()
+    out.columns = ["pozo", "yacimiento_maestro"]
+    out["pozo_key"] = out["pozo"].map(pozo_key)
+    out["yacimiento_maestro"] = out["yacimiento_maestro"].map(norm_txt)
+    out = out[(out["pozo_key"] != "") & (out["yacimiento_maestro"] != "")]
+    out = out.drop_duplicates("pozo_key")
+    return out[["pozo_key", "yacimiento_maestro"]]
+
+
 def agregar_totales_barras_verticales(fig: go.Figure, totales: pd.DataFrame, x_col: str, y_col: str, formato="{:,.0f}") -> go.Figure:
     """
     Agrega etiquetas de total encima de barras verticales, especialmente en barras apiladas.
@@ -265,6 +305,26 @@ def find_header_row(raw: pd.DataFrame) -> int | None:
     return None
 
 
+def es_columna_filtro_mes(serie: pd.Series) -> bool:
+    """
+    Detecta columnas tipo VERDADERO/FALSO usadas en los Excel para filtrar
+    el mes real visible. Pandas no respeta el autofiltro visual de Excel,
+    por eso se debe aplicar esta columna de forma explícita.
+    """
+    vals = serie.dropna().astype(str).map(norm_txt)
+    if len(vals) < 10:
+        return False
+
+    valores_validos = {"VERDADERO", "FALSO", "TRUE", "FALSE", "SI", "NO", "SÍ", "1", "0"}
+    ratio_validos = vals.isin(valores_validos).mean()
+    return ratio_validos >= 0.80 and vals.nunique() <= 4
+
+
+def valor_filtro_verdadero(valor) -> bool:
+    v = norm_txt(valor)
+    return v in {"VERDADERO", "TRUE", "SI", "SÍ", "1"}
+
+
 def extract_main_table(path: Path, sheet: str, header_row: int) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name=sheet, header=header_row, engine="openpyxl")
     clean_cols = [norm_txt(c) for c in df.columns]
@@ -284,7 +344,7 @@ def extract_main_table(path: Path, sheet: str, header_row: int) -> pd.DataFrame:
     yac_nombres = [
         "*YACIMIENTO", "YACIMIENTO", "*YAC", "YAC",
         "*ZONA", "ZONA", "*AREA", "AREA",
-        "*UBICACION", "UBICACION"
+        "*UBICACION", "UBICACION", "*CAMPO", "CAMPO"
     ]
     yac_pos = next((i for i, c in enumerate(clean_cols) if c in yac_nombres), None)
     out["yacimiento"] = df.iloc[:, yac_pos] if yac_pos is not None else ""
@@ -295,30 +355,65 @@ def extract_main_table(path: Path, sheet: str, header_row: int) -> pd.DataFrame:
     else:
         out["ult_est_anterior"] = ""
 
+    # Columna auxiliar tipo VERDADERO/FALSO.
+    # En tus Excel se usa para marcar qué filas pertenecen al mes de análisis.
+    posiciones_req = {v for v in positions.values() if v is not None}
+    filtro_pos = next(
+        (i for i in range(len(clean_cols)) if i not in posiciones_req and es_columna_filtro_mes(df.iloc[:, i])),
+        None
+    )
+
+    out["filtro_mes"] = df.iloc[:, filtro_pos] if filtro_pos is not None else "SIN FILTRO"
+    out["filtro_mes_detectado"] = "SI" if filtro_pos is not None else "NO"
+    out["columna_filtro_mes"] = clean_cols[filtro_pos] if filtro_pos is not None else ""
+
     out = out.dropna(subset=["pozo"])
     out = out[~out["pozo"].astype(str).str.startswith("*")].copy()
+
     for c in out.columns:
         out[c] = out[c].astype(str).str.strip().replace({"nan": "", "None": ""})
+
     out = out[out["pozo"].astype(str).str.strip() != ""]
+
+    # Si existe filtro VERDADERO/FALSO, se imita el filtro visible de Excel.
+    # Esto evita contar las 5820 filas históricas cuando Excel visualmente muestra 937.
+    if filtro_pos is not None:
+        out = out[out["filtro_mes"].map(valor_filtro_verdadero)].copy()
+
     return out
 
 
 def score_candidate(path: Path, sheet: str, periodo: pd.Timestamp, nrows: int) -> float:
     """
     Puntúa hojas candidatas dentro de un mismo Excel.
-    El periodo NO sale de la hoja, solo del nombre del archivo.
-    La hoja se elige por tener más filas útiles y, secundariamente,
-    por parecer una hoja principal.
-    """
-    score = float(nrows)
 
+    Regla corregida:
+    El periodo sale del nombre del archivo, pero si el Excel tiene varias hojas,
+    se prefiere FUERTEMENTE la hoja cuyo nombre coincide con el mes del archivo.
+    Las filas solo sirven como desempate. Esto evita que una hoja histórica o una
+    hoja auxiliar gane solo por tener más filas.
+    """
     sheet_norm = norm_txt(sheet)
-    if mes_from_text(sheet) == periodo.month:
-        score += 1000
-    if "HOJA" not in sheet_norm:
-        score += 200
+    mes_hoja = mes_from_text(sheet)
+
+    score = 0.0
+
+    if mes_hoja == periodo.month:
+        score += 1_000_000
+
+        # Si la hoja se llama exactamente como el mes, tiene prioridad adicional.
+        if sheet_norm == norm_txt(MESES_INV[periodo.month]):
+            score += 100_000
+
+    if "HOJA" in sheet_norm:
+        score -= 50_000
+    else:
+        score += 2_000
+
     if any(x in sheet_norm for x in ["ESTADO", "SWAB", "POZOS", "OIG"]):
-        score += 300
+        score += 1_000
+
+    score += min(float(nrows), 10_000)
 
     return score
 
@@ -505,6 +600,18 @@ def cargar_base() -> Tuple[pd.DataFrame, pd.DataFrame]:
     if "yacimiento" not in base.columns:
         base["yacimiento"] = ""
     base["yacimiento_clean"] = base["yacimiento"].map(lambda x: norm_txt(x) or "")
+
+    # Si existe maestro opcional, completa yacimiento por pozo.
+    maestro_yac = cargar_maestro_yacimientos()
+    if not maestro_yac.empty:
+        base = base.merge(maestro_yac, on="pozo_key", how="left")
+        base["yacimiento_clean"] = np.where(
+            base["yacimiento_clean"].eq("") & base["yacimiento_maestro"].notna(),
+            base["yacimiento_maestro"],
+            base["yacimiento_clean"]
+        )
+        base = base.drop(columns=["yacimiento_maestro"])
+
     base["es_swab"] = base.apply(es_swab, axis=1)
     base = base[base["es_swab"]].copy()
     base["condicion"] = base.apply(lambda r: condicion_operativa(r["ult_est"], r["estado"], r["tipo_pozo"]), axis=1)
@@ -1244,9 +1351,15 @@ def ui():
         fuentes["periodo"] = fuentes["fecha"].dt.strftime("%Y-%m")
         st.dataframe(fuentes[["periodo", "archivo_fuente", "hoja_fuente", "pozo_clean"]].rename(columns={"pozo_clean": "pozos_swab"}), use_container_width=True)
         st.caption(f"Se excluyen del análisis {len(POZOS_ATA_EXCLUIR_KEYS)} pozos candidatos ATA.")
+        if "yacimiento_clean" in base.columns and base["yacimiento_clean"].replace("", np.nan).dropna().nunique() <= 1:
+            st.warning(
+                "No se encontró una columna útil de yacimiento en los Excel ni un maestro de yacimientos. "
+                "La gráfica por yacimiento se mostrará como Batería/ubicación. "
+                "Para obtener CENTRAL, ZAPOTAL, TAIMAN, etc., agrega en la carpeta Data un archivo Maestro_Yacimientos.xlsx con columnas POZO y YACIMIENTO."
+            )
         if not log.empty:
-            st.caption("Detalle de carga de archivos")
-            st.dataframe(log, use_container_width=True, height=220)
+            st.caption("Detalle de carga de archivos. Revise aquí qué hoja fue seleccionada por cada Excel.")
+            st.dataframe(log, use_container_width=True, height=260)
 
     if not ejecutar and "ejecutado_swab" not in st.session_state:
         st.info("Seleccione el rango de meses y presione Ejecutar análisis.")
