@@ -44,6 +44,30 @@ MESES_INV = {
     7: "Julio", 8: "Agosto", 9: "Setiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"
 }
 
+# ============================================================
+# MAPEO MANUAL DE PERIODOS
+# ============================================================
+# Se usa porque varios Excel de Estado de Pozos tienen títulos internos
+# copiados de meses anteriores. El dashboard debe tomar el periodo desde
+# el nombre del archivo que estamos usando en la carpeta data.
+# Ajuste asumido para este proyecto: Mayo a Diciembre = 2025, Enero a Abril = 2026.
+# Si luego cargas Mayo 2026, cambia la línea de Mayo a (2026, 5).
+PERIODO_MANUAL_POR_ARCHIVO = {
+    "Estado de Pozos - Mayo OIG.xlsx": (2025, 5),
+    "Estado de Pozos - Junio OIG.xlsx": (2025, 6),
+    "Estado de Pozos - Julio OIG.xlsx": (2025, 7),
+    "Estado de Pozos - Agosto OIG.xlsx": (2025, 8),
+    "Estado de Pozos - Setiembre OIG.xlsx": (2025, 9),
+    "Estado de Pozos - Septiembre OIG.xlsx": (2025, 9),
+    "Estado de Pozos - Octubre OIG.xlsx": (2025, 10),
+    "Estado de Pozos - Noviembre OIG.xlsx": (2025, 11),
+    "Estado de Pozos - Diciembre OIG.xlsx": (2025, 12),
+    "Estado de Pozos - Enero OIG.xlsx": (2026, 1),
+    "Estado de Pozos - Febrero OIG.xlsx": (2026, 2),
+    "Estado de Pozos - Marzo OIG.xlsx": (2026, 3),
+    "Estado de Pozos - Abril OIG.xlsx": (2026, 4),
+}
+
 REQ = ["*PFORMACION", "*ESTADO", "*TIPO_DE_POZO", "*ULT_EST", "*BATERIA"]
 
 COLORS = {
@@ -138,6 +162,13 @@ def title_text(raw: pd.DataFrame) -> str:
 
 
 def infer_period(file_name: str, sheet_name: str, raw: pd.DataFrame) -> pd.Timestamp | None:
+    # Prioridad 1: mapeo manual por nombre de archivo.
+    # Esto evita que los títulos internos copiados del Excel muevan el año.
+    nombre_archivo = Path(file_name).name
+    if nombre_archivo in PERIODO_MANUAL_POR_ARCHIVO:
+        anio_manual, mes_manual = PERIODO_MANUAL_POR_ARCHIVO[nombre_archivo]
+        return pd.Timestamp(anio_manual, mes_manual, 1)
+
     title = title_text(raw)
     sheet_mes = mes_from_text(sheet_name)
     file_mes = mes_from_text(file_name)
@@ -204,6 +235,8 @@ def extract_main_table(path: Path, sheet: str, header_row: int) -> pd.DataFrame:
 
 def score_candidate(path: Path, sheet: str, periodo: pd.Timestamp, nrows: int) -> float:
     score = float(nrows) / 100000
+    if path.name in PERIODO_MANUAL_POR_ARCHIVO:
+        score += 8
     if mes_from_text(path.name) == periodo.month:
         score += 5
     if mes_from_text(sheet) == periodo.month:
@@ -919,24 +952,24 @@ def ui():
     with tabs[0]:
         c1, c2 = st.columns([1.1, 1])
         with c1:
-            st.plotly_chart(figs[0][1], use_container_width=True)
+            st.plotly_chart(figs[0][1], use_container_width=True, key="resumen_estado_swab")
         with c2:
-            st.plotly_chart(figs[3][1], use_container_width=True)
+            st.plotly_chart(figs[3][1], use_container_width=True, key="resumen_tipo_cierre")
         st.dataframe(resumen, use_container_width=True, hide_index=True)
 
     with tabs[1]:
-        for title, fig in figs[:4]:
-            st.plotly_chart(fig, use_container_width=True)
+        for i, (title, fig) in enumerate(figs[:4]):
+            st.plotly_chart(fig, use_container_width=True, key=f"tendencias_{i}")
 
     with tabs[2]:
-        for title, fig in figs[4:8]:
-            st.plotly_chart(fig, use_container_width=True)
+        for i, (title, fig) in enumerate(figs[4:8]):
+            st.plotly_chart(fig, use_container_width=True, key=f"ubicacion_{i}")
 
     with tabs[3]:
         if trans is not None:
-            st.plotly_chart(trans, use_container_width=True)
+            st.plotly_chart(trans, use_container_width=True, key="cambios_transicion_condicion")
         if sankey is not None:
-            st.plotly_chart(sankey, use_container_width=True)
+            st.plotly_chart(sankey, use_container_width=True, key="cambios_sankey_estado")
         st.dataframe(cambios, use_container_width=True, height=430)
 
     with tabs[4]:
