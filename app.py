@@ -21,7 +21,13 @@ except Exception:
     Presentation = None
 
 APP_TITLE = "Dashboard Pozos Swab Lote X"
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR_CANDIDATES = [
+    Path(__file__).parent / "data",
+    Path(__file__).parent / "Data",
+    Path(__file__).parent / "DATA",
+]
+
+DATA_DIR = next((p for p in DATA_DIR_CANDIDATES if p.exists()), DATA_DIR_CANDIDATES[0])
 
 MESES = {
     "ENERO": 1,
