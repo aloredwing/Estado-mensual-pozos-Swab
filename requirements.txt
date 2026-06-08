@@ -1,8 +1,7 @@
 streamlit
 pandas
 openpyxl
-plotly
-kaleido==0.2.1
-python-pptx
 numpy
-xlsxwriter
+plotly
+python-pptx
+kaleido
