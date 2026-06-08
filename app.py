@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 try:
@@ -21,12 +22,14 @@ except Exception:
     Presentation = None
 
 APP_TITLE = "Dashboard Pozos Swab Lote X"
+
+# Streamlit Cloud corre en Linux y distingue mayúsculas y minúsculas.
+# Por eso se aceptan data, Data o DATA.
 DATA_DIR_CANDIDATES = [
     Path(__file__).parent / "data",
     Path(__file__).parent / "Data",
     Path(__file__).parent / "DATA",
 ]
-
 DATA_DIR = next((p for p in DATA_DIR_CANDIDATES if p.exists()), DATA_DIR_CANDIDATES[0])
 
 MESES = {
@@ -63,6 +66,26 @@ MESES_INV = {
 # Si el nombre no tiene mes y año, el archivo se omite y se muestra en el log.
 
 REQ = ["*PFORMACION", "*ESTADO", "*TIPO_DE_POZO", "*ULT_EST", "*BATERIA"]
+
+# ============================================================
+# POZOS CANDIDATOS ATA EXCLUIDOS DEL ANÁLISIS SWAB
+# ============================================================
+# Estos 88 pozos no se consideran en KPIs, tablas, gráficas ni PPT.
+POZOS_ATA_EXCLUIR = [
+    "AA37", "AA54", "AA76", "AA112", "AA1577", "AA1598", "AA1599", "AA1633",
+    "AA1661", "AA1847", "AA1930", "AA5631", "AA5707", "AA5861", "AA5926",
+    "AA5971", "AA6192", "AA6338", "AA6342", "AA6372", "AA6423", "AA6454",
+    "AA6517", "AA6646", "AA6762", "AA7201", "AA9154", "AA9329", "AA9364",
+    "AA10013", "EA216", "EA264", "EA364", "EA440", "EA741", "EA771", "EA876",
+    "EA888", "EA987", "EA1054", "EA1081", "EA1161", "EA1167", "EA1233",
+    "EA1302", "EA1506", "EA1511", "EA1513", "EA1581", "EA1630", "EA1885",
+    "EA2067", "EA2249", "EA2254", "EA2256", "EA2304", "EA2372", "EA2389",
+    "EA2403", "EA5682D", "EA5694", "EA5739", "EA5766", "EA5868", "EA5874",
+    "EA5914", "EA5921", "EA5957", "EA6130", "EA6237", "EA6918", "EA7027",
+    "EA7158", "EA8574", "EA9242", "EA9251", "EA9287", "EA9409", "EA9417",
+    "EA9491", "EA9668", "EA9752", "EA9779", "EA11128", "PB47", "PB232",
+    "PE171", "PT4-3",
+]
 
 COLORS = {
     "navy": "#17233E",
@@ -134,6 +157,61 @@ def norm_txt(x) -> str:
     return re.sub(r"\s+", " ", s)
 
 
+def pozo_key(x) -> str:
+    """
+    Limpia el código de pozo para comparar listas fijas.
+    Quita espacios, guiones y símbolos no alfanuméricos.
+    """
+    s = norm_txt(x)
+    return re.sub(r"[^A-Z0-9]", "", s)
+
+
+POZOS_ATA_EXCLUIR_KEYS = {pozo_key(p) for p in POZOS_ATA_EXCLUIR}
+
+
+def agregar_totales_barras_verticales(fig: go.Figure, totales: pd.DataFrame, x_col: str, y_col: str, formato="{:,.0f}") -> go.Figure:
+    """
+    Agrega etiquetas de total encima de barras verticales, especialmente en barras apiladas.
+    """
+    if totales.empty:
+        return fig
+
+    ymax = float(totales[y_col].max()) if y_col in totales.columns else 0
+    offset = ymax * 0.035 if ymax > 0 else 1
+
+    fig.add_trace(go.Scatter(
+        x=totales[x_col],
+        y=totales[y_col] + offset,
+        mode="text",
+        text=[formato.format(v) for v in totales[y_col]],
+        textposition="top center",
+        textfont=dict(size=13, color=COLORS["navy"], family="Arial Black"),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+    if ymax > 0:
+        fig.update_yaxes(range=[0, ymax * 1.18])
+
+    return fig
+
+
+def obtener_columna_ubicacion(df: pd.DataFrame) -> str:
+    """
+    Para la lámina gerencial usa yacimiento si existe en el Excel.
+    Si no existe, usa batería. En algunos archivos solo aparece SWAB como batería.
+    """
+    if "yacimiento_clean" in df.columns and df["yacimiento_clean"].replace("", np.nan).dropna().nunique() > 1:
+        return "yacimiento_clean"
+    return "bateria_clean"
+
+
+def etiqueta_ubicacion(df: pd.DataFrame) -> str:
+    col = obtener_columna_ubicacion(df)
+    return "Yacimiento" if col == "yacimiento_clean" else "Batería / ubicación"
+
+
+
 def mes_from_text(text: str):
     t = norm_txt(text)
     for m, n in MESES.items():
@@ -201,6 +279,15 @@ def extract_main_table(path: Path, sheet: str, header_row: int) -> pd.DataFrame:
         "ult_est": df.iloc[:, positions["*ULT_EST"]],
         "bateria": df.iloc[:, positions["*BATERIA"]],
     })
+
+    # Si el Excel trae yacimiento/zona/área, se usa para la lámina gerencial.
+    yac_nombres = [
+        "*YACIMIENTO", "YACIMIENTO", "*YAC", "YAC",
+        "*ZONA", "ZONA", "*AREA", "AREA",
+        "*UBICACION", "UBICACION"
+    ]
+    yac_pos = next((i for i, c in enumerate(clean_cols) if c in yac_nombres), None)
+    out["yacimiento"] = df.iloc[:, yac_pos] if yac_pos is not None else ""
 
     prev_cols = [i for i, c in enumerate(clean_cols) if c.startswith("*ULT_EST ") or c.startswith("*ULT_EST_")]
     if prev_cols:
@@ -406,10 +493,18 @@ def cargar_base() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     base = pd.concat(all_rows, ignore_index=True)
     base["pozo_clean"] = base["pozo"].map(norm_txt)
+    base["pozo_key"] = base["pozo"].map(pozo_key)
+
+    # Excluir candidatos ATA antes de cualquier KPI, tabla o gráfica.
+    base = base[~base["pozo_key"].isin(POZOS_ATA_EXCLUIR_KEYS)].copy()
+
     base["estado_clean"] = base["estado"].map(norm_txt)
     base["tipo_clean"] = base["tipo_pozo"].map(norm_txt)
     base["ult_est_clean"] = base["ult_est"].map(lambda x: norm_txt(x) or "SIN DATO")
     base["bateria_clean"] = base["bateria"].map(lambda x: norm_txt(x).replace("CA ", "CA-") or "SIN DATO")
+    if "yacimiento" not in base.columns:
+        base["yacimiento"] = ""
+    base["yacimiento_clean"] = base["yacimiento"].map(lambda x: norm_txt(x) or "")
     base["es_swab"] = base.apply(es_swab, axis=1)
     base = base[base["es_swab"]].copy()
     base["condicion"] = base.apply(lambda r: condicion_operativa(r["ult_est"], r["estado"], r["tipo_pozo"]), axis=1)
@@ -504,6 +599,8 @@ def layout_fig(fig: go.Figure, height: int = 470, legend: str = "") -> go.Figure
 def fig_estado_swab(df: pd.DataFrame) -> go.Figure:
     t = df.groupby(["fecha", "mes_label", "condicion"], as_index=False)["pozo_clean"].nunique()
     t = t.rename(columns={"pozo_clean": "pozos"})
+    totales = df.groupby("fecha", as_index=False)["pozo_clean"].nunique().rename(columns={"pozo_clean": "total"})
+
     fig = px.bar(
         t,
         x="fecha",
@@ -514,10 +611,10 @@ def fig_estado_swab(df: pd.DataFrame) -> go.Figure:
         title="Estado de Pozos Swab por mes",
     )
     fig.update_traces(textposition="inside", textfont_size=12)
+    fig = agregar_totales_barras_verticales(fig, totales, "fecha", "total")
     fig.update_xaxes(title="Mes", tickformat="%b %Y")
     fig.update_yaxes(title="Cantidad de pozos")
     return layout_fig(fig, 500, "Condición")
-
 
 def fig_pct_inactivos(df: pd.DataFrame) -> go.Figure:
     t = df.groupby(["fecha", "condicion"], as_index=False)["pozo_clean"].nunique().rename(columns={"pozo_clean": "pozos"})
@@ -563,23 +660,208 @@ def fig_turno_swab(df: pd.DataFrame) -> go.Figure:
 def fig_tipo_cierre(df: pd.DataFrame) -> go.Figure:
     fin = df["fecha"].max()
     d = base_mes(df, fin)
-    t = d.groupby("tipo_swab", as_index=False)["pozo_clean"].nunique().rename(columns={"pozo_clean": "pozos"})
-    t = t.sort_values("pozos", ascending=True)
+
+    t = (
+        d.groupby(["tipo_swab", "condicion"], as_index=False)["pozo_clean"]
+        .nunique()
+        .rename(columns={"pozo_clean": "pozos"})
+    )
+    totales = (
+        d.groupby("tipo_swab", as_index=False)["pozo_clean"]
+        .nunique()
+        .rename(columns={"pozo_clean": "total"})
+    )
+
     fig = px.bar(
         t,
-        x="pozos",
-        y="tipo_swab",
-        orientation="h",
+        x="tipo_swab",
+        y="pozos",
+        color="condicion",
         text="pozos",
-        color="tipo_swab",
-        color_discrete_sequence=[COLORS["blue"], COLORS["orange"], COLORS["green"], COLORS["gray"]],
-        title=f"Tipo de Pozos Swab al cierre de {pretty_period(fin)}",
+        color_discrete_map=COLOR_CONDICION,
+        title=f"Por Tipo de Pozo Swab al cierre de {pretty_period(fin)}",
     )
-    fig.update_traces(textposition="outside", cliponaxis=False)
-    fig.update_xaxes(title="Cantidad de pozos")
-    fig.update_yaxes(title="Tipo")
-    return layout_fig(fig, 440, "")
+    fig.update_traces(textposition="inside", textfont_size=12)
+    fig = agregar_totales_barras_verticales(fig, totales, "tipo_swab", "total")
+    fig.update_xaxes(title="Tipo de pozo Swab")
+    fig.update_yaxes(title="N° Pozos")
+    return layout_fig(fig, 460, "Condición")
 
+
+def fig_ubicacion_cierre(df: pd.DataFrame) -> go.Figure:
+    fin = df["fecha"].max()
+    d = base_mes(df, fin)
+    col_ubi = obtener_columna_ubicacion(d)
+    nombre_ubi = etiqueta_ubicacion(d)
+
+    t = (
+        d.groupby([col_ubi, "condicion"], as_index=False)["pozo_clean"]
+        .nunique()
+        .rename(columns={"pozo_clean": "pozos", col_ubi: "ubicacion"})
+    )
+    totales = (
+        d.groupby(col_ubi, as_index=False)["pozo_clean"]
+        .nunique()
+        .rename(columns={"pozo_clean": "total", col_ubi: "ubicacion"})
+    )
+
+    top = totales.sort_values("total", ascending=False).head(18)["ubicacion"]
+    t = t[t["ubicacion"].isin(top)].copy()
+    totales = totales[totales["ubicacion"].isin(top)].copy()
+
+    orden = totales.sort_values("total", ascending=False)["ubicacion"].tolist()
+
+    fig = px.bar(
+        t,
+        x="ubicacion",
+        y="pozos",
+        color="condicion",
+        text="pozos",
+        category_orders={"ubicacion": orden},
+        color_discrete_map=COLOR_CONDICION,
+        title=f"Por {nombre_ubi} al cierre de {pretty_period(fin)}",
+    )
+    fig.update_traces(textposition="inside", textfont_size=11)
+    fig = agregar_totales_barras_verticales(fig, totales, "ubicacion", "total")
+    fig.update_xaxes(title=nombre_ubi, tickangle=-45)
+    fig.update_yaxes(title="N° Pozos")
+    return layout_fig(fig, 520, "Condición")
+
+
+def fig_lamina_ubicacion_tipo(df: pd.DataFrame) -> go.Figure:
+    """
+    Lámina gerencial similar a la referencia enviada:
+    Total de pozos, distribución por ubicación y distribución por tipo de pozo.
+    """
+    fin = df["fecha"].max()
+    d = base_mes(df, fin)
+    total_swab = n_pozos(d)
+    activos = n_pozos(d[d["condicion"] == "Activo"])
+    inactivos = n_pozos(d[d["condicion"] == "Inactivo"])
+
+    col_ubi = obtener_columna_ubicacion(d)
+    nombre_ubi = etiqueta_ubicacion(d)
+
+    ubi = (
+        d.groupby([col_ubi, "condicion"], as_index=False)["pozo_clean"]
+        .nunique()
+        .rename(columns={"pozo_clean": "pozos", col_ubi: "ubicacion"})
+    )
+    ubi_tot = (
+        d.groupby(col_ubi, as_index=False)["pozo_clean"]
+        .nunique()
+        .rename(columns={"pozo_clean": "total", col_ubi: "ubicacion"})
+        .sort_values("total", ascending=False)
+        .head(14)
+    )
+    ubi = ubi[ubi["ubicacion"].isin(ubi_tot["ubicacion"])].copy()
+    ubi_order = ubi_tot["ubicacion"].tolist()
+
+    tipo = (
+        d.groupby(["tipo_swab", "condicion"], as_index=False)["pozo_clean"]
+        .nunique()
+        .rename(columns={"pozo_clean": "pozos"})
+    )
+    tipo_tot = (
+        d.groupby("tipo_swab", as_index=False)["pozo_clean"]
+        .nunique()
+        .rename(columns={"pozo_clean": "total"})
+        .sort_values("total", ascending=False)
+    )
+    tipo_order = tipo_tot["tipo_swab"].tolist()
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        vertical_spacing=0.20,
+        subplot_titles=(f"Por {nombre_ubi}", "Por Tipo de Pozo")
+    )
+
+    # Ubicación
+    for condicion in ["Activo", "Inactivo", "Observación"]:
+        parte = ubi[ubi["condicion"] == condicion].set_index("ubicacion").reindex(ubi_order).fillna(0)
+        fig.add_trace(
+            go.Bar(
+                x=ubi_order,
+                y=parte["pozos"],
+                name=condicion,
+                marker_color=COLOR_CONDICION.get(condicion, COLORS["gray"]),
+                text=[f"{int(v)}" if v > 0 else "" for v in parte["pozos"]],
+                textposition="inside",
+                legendgroup=condicion,
+                showlegend=True,
+            ),
+            row=1,
+            col=1
+        )
+
+    ymax1 = float(ubi_tot["total"].max()) if not ubi_tot.empty else 0
+    fig.add_trace(
+        go.Scatter(
+            x=ubi_order,
+            y=ubi_tot.set_index("ubicacion").reindex(ubi_order)["total"] + max(ymax1 * 0.035, 1),
+            mode="text",
+            text=[str(int(v)) for v in ubi_tot.set_index("ubicacion").reindex(ubi_order)["total"]],
+            textfont=dict(size=12, color=COLORS["navy"], family="Arial Black"),
+            showlegend=False,
+            hoverinfo="skip",
+        ),
+        row=1,
+        col=1
+    )
+
+    # Tipo
+    for condicion in ["Activo", "Inactivo", "Observación"]:
+        parte = tipo[tipo["condicion"] == condicion].set_index("tipo_swab").reindex(tipo_order).fillna(0)
+        fig.add_trace(
+            go.Bar(
+                x=tipo_order,
+                y=parte["pozos"],
+                name=condicion,
+                marker_color=COLOR_CONDICION.get(condicion, COLORS["gray"]),
+                text=[f"{int(v)}" if v > 0 else "" for v in parte["pozos"]],
+                textposition="inside",
+                legendgroup=condicion,
+                showlegend=False,
+            ),
+            row=2,
+            col=1
+        )
+
+    ymax2 = float(tipo_tot["total"].max()) if not tipo_tot.empty else 0
+    fig.add_trace(
+        go.Scatter(
+            x=tipo_order,
+            y=tipo_tot.set_index("tipo_swab").reindex(tipo_order)["total"] + max(ymax2 * 0.035, 1),
+            mode="text",
+            text=[str(int(v)) for v in tipo_tot.set_index("tipo_swab").reindex(tipo_order)["total"]],
+            textfont=dict(size=12, color=COLORS["navy"], family="Arial Black"),
+            showlegend=False,
+            hoverinfo="skip",
+        ),
+        row=2,
+        col=1
+    )
+
+    fig.update_layout(
+        title=f"Total de Pozos Swab: {total_swab:,} | Activos: {activos:,} | Inactivos: {inactivos:,} | Cierre: {pretty_period(fin)}",
+        barmode="stack",
+        template="plotly_white",
+        height=900,
+        font=dict(family="Arial", color=COLORS["navy"], size=13),
+        title_font=dict(size=24, color=COLORS["navy"], family="Arial Black"),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        legend_title_text="Condición",
+        margin=dict(l=45, r=30, t=95, b=60),
+    )
+
+    fig.update_xaxes(tickangle=-45, row=1, col=1)
+    fig.update_yaxes(title="N° Pozos", row=1, col=1, range=[0, ymax1 * 1.18 if ymax1 else 10])
+    fig.update_xaxes(row=2, col=1)
+    fig.update_yaxes(title="N° Pozos", row=2, col=1, range=[0, ymax2 * 1.18 if ymax2 else 10])
+
+    return fig
 
 def fig_estado_final(df: pd.DataFrame) -> go.Figure:
     fin = df["fecha"].max()
@@ -606,67 +888,73 @@ def fig_estado_final(df: pd.DataFrame) -> go.Figure:
 def fig_bateria_total(df: pd.DataFrame) -> go.Figure:
     fin = df["fecha"].max()
     d = base_mes(df, fin)
-    t = d.groupby(["bateria_clean", "condicion"], as_index=False)["pozo_clean"].nunique().rename(columns={"pozo_clean": "pozos"})
-    top = d.groupby("bateria_clean")["pozo_clean"].nunique().sort_values(ascending=False).head(18).index
-    t = t[t["bateria_clean"].isin(top)]
+    col_ubi = obtener_columna_ubicacion(d)
+    nombre_ubi = etiqueta_ubicacion(d)
+
+    t = d.groupby([col_ubi, "condicion"], as_index=False)["pozo_clean"].nunique().rename(columns={"pozo_clean": "pozos", col_ubi: "ubicacion"})
+    top = d.groupby(col_ubi)["pozo_clean"].nunique().sort_values(ascending=False).head(18).index
+    t = t[t["ubicacion"].isin(top)]
     fig = px.bar(
         t,
         x="pozos",
-        y="bateria_clean",
+        y="ubicacion",
         color="condicion",
         orientation="h",
         text="pozos",
         color_discrete_map=COLOR_CONDICION,
         title=f"Ubicación y condición de Pozos Swab al cierre de {pretty_period(fin)}",
     )
-    fig.update_yaxes(categoryorder="total ascending", title="Batería")
+    fig.update_yaxes(categoryorder="total ascending", title=nombre_ubi)
     fig.update_xaxes(title="Cantidad de pozos")
     return layout_fig(fig, 620, "Condición")
-
 
 def fig_bateria_inactivos(df: pd.DataFrame) -> go.Figure:
     fin = df["fecha"].max()
     d = base_mes(df, fin)
-    total = d.groupby("bateria_clean", as_index=False)["pozo_clean"].nunique().rename(columns={"pozo_clean": "total"})
-    ina = d[d["condicion"] == "Inactivo"].groupby("bateria_clean", as_index=False)["pozo_clean"].nunique().rename(columns={"pozo_clean": "inactivos"})
-    t = total.merge(ina, on="bateria_clean", how="left").fillna(0)
+    col_ubi = obtener_columna_ubicacion(d)
+    nombre_ubi = etiqueta_ubicacion(d)
+
+    total = d.groupby(col_ubi, as_index=False)["pozo_clean"].nunique().rename(columns={"pozo_clean": "total", col_ubi: "ubicacion"})
+    ina = d[d["condicion"] == "Inactivo"].groupby(col_ubi, as_index=False)["pozo_clean"].nunique().rename(columns={"pozo_clean": "inactivos", col_ubi: "ubicacion"})
+    t = total.merge(ina, on="ubicacion", how="left").fillna(0)
     t = t[t["total"] >= 5].copy()
     t["pct_inactivo"] = np.where(t["total"] > 0, t["inactivos"] / t["total"] * 100, 0)
     t = t.sort_values(["pct_inactivo", "inactivos"], ascending=True).tail(15)
     fig = px.bar(
         t,
         x="pct_inactivo",
-        y="bateria_clean",
+        y="ubicacion",
         orientation="h",
         text=[f"{v:.1f}%" for v in t["pct_inactivo"]],
         color="pct_inactivo",
         color_continuous_scale="OrRd",
-        title=f"Baterías con mayor proporción de pozos Swab inactivos en {pretty_period(fin)}",
+        title=f"{nombre_ubi}s con mayor proporción de pozos Swab inactivos en {pretty_period(fin)}",
     )
     fig.update_layout(coloraxis_showscale=False)
     fig.update_xaxes(title="% inactivo", ticksuffix="%")
-    fig.update_yaxes(title="Batería")
+    fig.update_yaxes(title=nombre_ubi)
     return layout_fig(fig, 540)
-
 
 def fig_matriz_bateria_estado(df: pd.DataFrame) -> go.Figure:
     fin = df["fecha"].max()
     d = base_mes(df, fin)
-    top_bat = d["bateria_clean"].value_counts().head(15).index
+    col_ubi = obtener_columna_ubicacion(d)
+    nombre_ubi = etiqueta_ubicacion(d)
+
+    top_ubi = d[col_ubi].value_counts().head(15).index
     top_est = d["ult_est_clean"].value_counts().head(10).index
-    d = d[d["bateria_clean"].isin(top_bat) & d["ult_est_clean"].isin(top_est)]
-    pivot = d.pivot_table(index="bateria_clean", columns="ult_est_clean", values="pozo_clean", aggfunc="nunique", fill_value=0)
+    d = d[d[col_ubi].isin(top_ubi) & d["ult_est_clean"].isin(top_est)]
+    pivot = d.pivot_table(index=col_ubi, columns="ult_est_clean", values="pozo_clean", aggfunc="nunique", fill_value=0)
     fig = px.imshow(
         pivot,
         text_auto=True,
         aspect="auto",
         color_continuous_scale="YlGnBu",
-        title=f"Matriz Batería vs Estado Swab en {pretty_period(fin)}",
+        title=f"Matriz {nombre_ubi} vs Estado Swab en {pretty_period(fin)}",
     )
     fig.update_xaxes(title="Último estado")
-    fig.update_yaxes(title="Batería")
+    fig.update_yaxes(title=nombre_ubi)
     return layout_fig(fig, 650)
-
 
 def fig_variacion_mensual(df: pd.DataFrame) -> go.Figure:
     t = df.groupby("fecha", as_index=False)["pozo_clean"].nunique().rename(columns={"pozo_clean": "total_swab"})
@@ -778,6 +1066,10 @@ def conclusion_table(df: pd.DataFrame) -> pd.DataFrame:
 def csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
+
+
+def safe_key(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]+", "_", str(text)).strip("_").lower()
 
 def fig_to_png(fig: go.Figure, width=1500, height=850) -> bytes:
     return fig.to_image(format="png", width=width, height=height, scale=2)
@@ -928,7 +1220,7 @@ def ui():
 
     base, log = cargar_base()
     if base.empty:
-        st.error("No se encontró información válida. Verifique que exista la carpeta data junto a app.py con los Excel de Estado de Pozos.")
+        st.error("No se encontró información válida. Verifique que exista la carpeta data o Data junto a app.py con los Excel de Estado de Pozos.")
         st.stop()
 
     periodos = sorted(base["fecha"].drop_duplicates().tolist())
@@ -951,6 +1243,7 @@ def ui():
         fuentes = base.groupby(["fecha", "archivo_fuente", "hoja_fuente"], as_index=False)["pozo_clean"].nunique()
         fuentes["periodo"] = fuentes["fecha"].dt.strftime("%Y-%m")
         st.dataframe(fuentes[["periodo", "archivo_fuente", "hoja_fuente", "pozo_clean"]].rename(columns={"pozo_clean": "pozos_swab"}), use_container_width=True)
+        st.caption(f"Se excluyen del análisis {len(POZOS_ATA_EXCLUIR_KEYS)} pozos candidatos ATA.")
         if not log.empty:
             st.caption("Detalle de carga de archivos")
             st.dataframe(log, use_container_width=True, height=220)
@@ -979,6 +1272,7 @@ def ui():
     show_kpis(kpis)
 
     figs = [
+        ("Lámina ubicación y tipo", fig_lamina_ubicacion_tipo(df)),
         ("Estado de Pozos Swab", fig_estado_swab(df)),
         ("Tendencia de inactivos", fig_pct_inactivos(df)),
         ("Tipo operativo 24 Hrs y 12 Hrs", fig_turno_swab(df)),
@@ -986,7 +1280,7 @@ def ui():
         ("Ubicación y condición", fig_bateria_total(df)),
         ("Baterías con mayor inactividad", fig_bateria_inactivos(df)),
         ("Estados operativos al cierre", fig_estado_final(df)),
-        ("Matriz Batería vs Estado", fig_matriz_bateria_estado(df)),
+        ("Matriz ubicación vs Estado", fig_matriz_bateria_estado(df)),
         ("Variación mensual de Pozos Swab", fig_variacion_mensual(df)),
     ]
     trans = fig_transiciones(df)
@@ -999,38 +1293,49 @@ def ui():
     resumen = conclusion_table(df)
     cambios = cambios_entre_extremos(df)
 
-    tabs = st.tabs(["Resumen PPT", "Tendencias", "Ubicación", "Cambios", "Base", "Exportar"])
+    tabs = st.tabs(["Resumen PPT", "Lámina ubicación y tipo", "Tendencias", "Ubicación", "Cambios", "Base", "Exportar"])
 
     with tabs[0]:
         c1, c2 = st.columns([1.1, 1])
         with c1:
-            st.plotly_chart(figs[0][1], use_container_width=True, key="resumen_estado_swab")
+            st.plotly_chart(figs[1][1], use_container_width=True, key="resumen_estado_swab")
         with c2:
-            st.plotly_chart(figs[3][1], use_container_width=True, key="resumen_tipo_cierre")
+            st.plotly_chart(figs[4][1], use_container_width=True, key="resumen_tipo_cierre")
         st.dataframe(resumen, use_container_width=True, hide_index=True)
 
     with tabs[1]:
-        for i, (title, fig) in enumerate(figs[:4]):
-            st.plotly_chart(fig, use_container_width=True, key=f"tendencias_{i}")
+        st.plotly_chart(figs[0][1], use_container_width=True, key="lamina_ubicacion_tipo")
 
     with tabs[2]:
-        for i, (title, fig) in enumerate(figs[4:8]):
-            st.plotly_chart(fig, use_container_width=True, key=f"ubicacion_{i}")
+        for i, (title, fig) in enumerate(figs[1:5]):
+            st.plotly_chart(fig, use_container_width=True, key=f"tendencias_{i}_{safe_key(title)}")
 
     with tabs[3]:
+        for i, (title, fig) in enumerate(figs[5:9]):
+            st.plotly_chart(fig, use_container_width=True, key=f"ubicacion_{i}_{safe_key(title)}")
+
+    with tabs[4]:
         if trans is not None:
             st.plotly_chart(trans, use_container_width=True, key="cambios_transicion_condicion")
         if sankey is not None:
             st.plotly_chart(sankey, use_container_width=True, key="cambios_sankey_estado")
         st.dataframe(cambios, use_container_width=True, height=430)
 
-    with tabs[4]:
+    with tabs[5]:
         st.dataframe(df, use_container_width=True, height=520)
 
-    with tabs[5]:
+    with tabs[6]:
         st.download_button("Descargar base Swab filtrada CSV", data=csv_bytes(df), file_name="base_swab_filtrada.csv", mime="text/csv")
         st.download_button("Descargar cambios CSV", data=csv_bytes(cambios), file_name="cambios_pozos_swab.csv", mime="text/csv")
         st.download_button("Descargar resumen CSV", data=csv_bytes(resumen), file_name="resumen_pozos_swab.csv", mime="text/csv")
+
+        excluidos_df = pd.DataFrame({"pozos_ata_excluidos": sorted(POZOS_ATA_EXCLUIR_KEYS)})
+        st.download_button(
+            "Descargar lista de pozos ATA excluidos CSV",
+            data=csv_bytes(excluidos_df),
+            file_name="pozos_ata_excluidos.csv",
+            mime="text/csv"
+        )
 
         for title, fig in figs:
             safe = re.sub(r"[^A-Za-z0-9_]+", "_", title).strip("_").lower()
@@ -1055,7 +1360,6 @@ def ui():
             )
         except Exception as e:
             st.warning(f"No se pudo generar la PPT. Revise kaleido y python-pptx en requirements.txt. Detalle: {e}")
-
 
 if __name__ == "__main__":
     ui()
