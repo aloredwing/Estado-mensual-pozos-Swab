@@ -45,28 +45,16 @@ MESES_INV = {
 }
 
 # ============================================================
-# MAPEO MANUAL DE PERIODOS
+# REGLA DE PERIODO
 # ============================================================
-# Se usa porque varios Excel de Estado de Pozos tienen títulos internos
-# copiados de meses anteriores. El dashboard debe tomar el periodo desde
-# el nombre del archivo que estamos usando en la carpeta data.
-# Ajuste asumido para este proyecto: Mayo a Diciembre = 2025, Enero a Abril = 2026.
-# Si luego cargas Mayo 2026, cambia la línea de Mayo a (2026, 5).
-PERIODO_MANUAL_POR_ARCHIVO = {
-    "Estado de Pozos - Mayo OIG.xlsx": (2025, 5),
-    "Estado de Pozos - Junio OIG.xlsx": (2025, 6),
-    "Estado de Pozos - Julio OIG.xlsx": (2025, 7),
-    "Estado de Pozos - Agosto OIG.xlsx": (2025, 8),
-    "Estado de Pozos - Setiembre OIG.xlsx": (2025, 9),
-    "Estado de Pozos - Septiembre OIG.xlsx": (2025, 9),
-    "Estado de Pozos - Octubre OIG.xlsx": (2025, 10),
-    "Estado de Pozos - Noviembre OIG.xlsx": (2025, 11),
-    "Estado de Pozos - Diciembre OIG.xlsx": (2025, 12),
-    "Estado de Pozos - Enero OIG.xlsx": (2026, 1),
-    "Estado de Pozos - Febrero OIG.xlsx": (2026, 2),
-    "Estado de Pozos - Marzo OIG.xlsx": (2026, 3),
-    "Estado de Pozos - Abril OIG.xlsx": (2026, 4),
-}
+# Este dashboard toma el mes y el año ÚNICAMENTE desde el nombre del archivo.
+# Esto evita errores cuando una hoja interna trae títulos copiados de otro mes.
+# Ejemplos válidos:
+#   Estado de Pozos - Abril 2024.xlsx
+#   Estado de Pozos - Abril 2025 OIG.xlsx
+#   Estado de Pozos - Abril 2026 OIG.xlsx
+#   Estado de Pozos - Julio OIG 2024.xlsx
+# Si el nombre no tiene mes y año, el archivo se omite y se muestra en el log.
 
 REQ = ["*PFORMACION", "*ESTADO", "*TIPO_DE_POZO", "*ULT_EST", "*BATERIA"]
 
@@ -153,6 +141,24 @@ def year_from_text(text: str):
     return int(m.group(1)) if m else None
 
 
+def periodo_desde_nombre_archivo(file_name: str) -> pd.Timestamp | None:
+    """
+    Devuelve el periodo usando solo el nombre del archivo.
+
+    Regla del proyecto:
+    El mes y el año válidos son los que aparecen en el nombre del Excel,
+    no los títulos internos ni el nombre de la hoja.
+    """
+    nombre = Path(file_name).stem
+    mes = mes_from_text(nombre)
+    anio = year_from_text(nombre)
+
+    if mes is None or anio is None:
+        return None
+
+    return pd.Timestamp(int(anio), int(mes), 1)
+
+
 def title_text(raw: pd.DataFrame) -> str:
     vals = []
     for v in raw.iloc[:4, :12].to_numpy().ravel():
@@ -162,38 +168,9 @@ def title_text(raw: pd.DataFrame) -> str:
 
 
 def infer_period(file_name: str, sheet_name: str, raw: pd.DataFrame) -> pd.Timestamp | None:
-    # Prioridad 1: mapeo manual por nombre de archivo.
-    # Esto evita que los títulos internos copiados del Excel muevan el año.
-    nombre_archivo = Path(file_name).name
-    if nombre_archivo in PERIODO_MANUAL_POR_ARCHIVO:
-        anio_manual, mes_manual = PERIODO_MANUAL_POR_ARCHIVO[nombre_archivo]
-        return pd.Timestamp(anio_manual, mes_manual, 1)
-
-    title = title_text(raw)
-    sheet_mes = mes_from_text(sheet_name)
-    file_mes = mes_from_text(file_name)
-    title_mes = mes_from_text(title)
-    title_anio = year_from_text(title)
-
-    mes = sheet_mes or file_mes or title_mes
-    if not mes:
-        return None
-
-    anio = title_anio
-    if anio is not None and title_mes is not None and title_mes != mes:
-        if title_mes == 12 and mes == 1:
-            anio = title_anio + 1
-        else:
-            anio = title_anio
-
-    if anio is None:
-        file_norm = norm_txt(file_name)
-        if "OIG" in file_norm:
-            anio = 2025 if mes <= 5 else 2024
-        else:
-            anio = 2024
-
-    return pd.Timestamp(anio, mes, 1)
+    # Se conserva la firma por compatibilidad, pero la regla ahora es estricta:
+    # el periodo sale únicamente del nombre del archivo.
+    return periodo_desde_nombre_archivo(file_name)
 
 
 def find_header_row(raw: pd.DataFrame) -> int | None:
@@ -234,17 +211,22 @@ def extract_main_table(path: Path, sheet: str, header_row: int) -> pd.DataFrame:
 
 
 def score_candidate(path: Path, sheet: str, periodo: pd.Timestamp, nrows: int) -> float:
-    score = float(nrows) / 100000
-    if path.name in PERIODO_MANUAL_POR_ARCHIVO:
-        score += 8
-    if mes_from_text(path.name) == periodo.month:
-        score += 5
+    """
+    Puntúa hojas candidatas dentro de un mismo Excel.
+    El periodo NO sale de la hoja, solo del nombre del archivo.
+    La hoja se elige por tener más filas útiles y, secundariamente,
+    por parecer una hoja principal.
+    """
+    score = float(nrows)
+
+    sheet_norm = norm_txt(sheet)
     if mes_from_text(sheet) == periodo.month:
-        score += 5
-    if "OIG" in norm_txt(path.name):
-        score += 0.5
-    if "HOJA" not in norm_txt(sheet):
-        score += 0.3
+        score += 1000
+    if "HOJA" not in sheet_norm:
+        score += 200
+    if any(x in sheet_norm for x in ["ESTADO", "SWAB", "POZOS", "OIG"]):
+        score += 300
+
     return score
 
 
@@ -306,25 +288,52 @@ def cargar_base() -> Tuple[pd.DataFrame, pd.DataFrame]:
     log_rows = []
 
     for path in files:
+        periodo_archivo = periodo_desde_nombre_archivo(path.name)
+
+        if periodo_archivo is None:
+            log_rows.append({
+                "archivo": path.name,
+                "hoja": "",
+                "periodo": "",
+                "filas": 0,
+                "score": 0,
+                "estado_carga": "Omitido: el nombre del archivo no tiene mes y año. Renombrar como 'Estado de Pozos - Abril 2026 OIG.xlsx'.",
+            })
+            continue
+
         try:
             xl = pd.ExcelFile(path, engine="openpyxl")
         except Exception as e:
-            log_rows.append({"archivo": path.name, "hoja": "", "periodo": "", "estado_carga": f"Error al abrir: {e}"})
+            log_rows.append({
+                "archivo": path.name,
+                "hoja": "",
+                "periodo": periodo_archivo.strftime("%Y-%m"),
+                "filas": 0,
+                "score": 0,
+                "estado_carga": f"Error al abrir: {e}",
+            })
             continue
+
+        encontro_candidato = False
 
         for sheet in xl.sheet_names:
             try:
                 raw = pd.read_excel(path, sheet_name=sheet, header=None, nrows=15, engine="openpyxl")
                 header_row = find_header_row(raw)
+
                 if header_row is None:
                     continue
-                periodo = infer_period(path.name, sheet, raw)
-                if periodo is None:
-                    continue
+
+                # El periodo se toma estrictamente del nombre del archivo.
+                periodo = periodo_archivo
+
                 df = extract_main_table(path, sheet, header_row)
                 if df.empty:
                     continue
+
+                encontro_candidato = True
                 sc = score_candidate(path, sheet, periodo, len(df))
+
                 log_rows.append({
                     "archivo": path.name,
                     "hoja": sheet,
@@ -333,12 +342,38 @@ def cargar_base() -> Tuple[pd.DataFrame, pd.DataFrame]:
                     "score": round(sc, 3),
                     "estado_carga": "Candidato",
                 })
+
                 if periodo not in candidates or sc > candidates[periodo]["score"]:
-                    candidates[periodo] = {"df": df, "score": sc, "archivo": path.name, "hoja": sheet}
+                    candidates[periodo] = {
+                        "df": df,
+                        "score": sc,
+                        "archivo": path.name,
+                        "hoja": sheet,
+                    }
+
             except Exception as e:
-                log_rows.append({"archivo": path.name, "hoja": sheet, "periodo": "", "estado_carga": f"Error hoja: {e}"})
+                log_rows.append({
+                    "archivo": path.name,
+                    "hoja": sheet,
+                    "periodo": periodo_archivo.strftime("%Y-%m"),
+                    "filas": 0,
+                    "score": 0,
+                    "estado_carga": f"Error hoja: {e}",
+                })
+
+        if not encontro_candidato:
+            log_rows.append({
+                "archivo": path.name,
+                "hoja": "",
+                "periodo": periodo_archivo.strftime("%Y-%m"),
+                "filas": 0,
+                "score": 0,
+                "estado_carga": "Sin hoja válida: no se encontró la fila de encabezados requeridos.",
+            })
 
     all_rows = []
+    seleccionados = []
+
     for periodo, item in sorted(candidates.items()):
         df = item["df"].copy()
         df["fecha"] = periodo
@@ -348,6 +383,17 @@ def cargar_base() -> Tuple[pd.DataFrame, pd.DataFrame]:
         df["archivo_fuente"] = item["archivo"]
         df["hoja_fuente"] = item["hoja"]
         all_rows.append(df)
+
+        seleccionados.append({
+            "archivo": item["archivo"],
+            "hoja": item["hoja"],
+            "periodo": periodo.strftime("%Y-%m"),
+            "filas": len(df),
+            "score": round(float(item["score"]), 3),
+            "estado_carga": "Seleccionado",
+        })
+
+    log_rows.extend(seleccionados)
 
     if not all_rows:
         return pd.DataFrame(), pd.DataFrame(log_rows)
@@ -868,7 +914,7 @@ def ui():
         """
         <div class="hero">
             <h1>Dashboard Pozos Swab Lote X</h1>
-            <p>Base fija de Excel en carpeta data. El análisis trabaja solamente con pozos Swab y se ejecuta al presionar el botón.</p>
+            <p>Base fija de Excel en carpeta data. El mes y año se toman del nombre del archivo. El análisis trabaja solamente con pozos Swab y se ejecuta al presionar el botón.</p>
         </div>
         """,
         unsafe_allow_html=True,
